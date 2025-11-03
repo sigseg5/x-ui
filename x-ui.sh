@@ -123,11 +123,19 @@ uninstall() {
         fi
         return 0
     fi
-    systemctl stop x-ui
-    systemctl disable x-ui
-    rm /etc/systemd/system/x-ui.service -f
-    systemctl daemon-reload
-    systemctl reset-failed
+    if [[ ${HAS_SYSTEMD:-0} -eq 1 ]]; then
+        systemctl stop x-ui
+        systemctl disable x-ui
+        rm /etc/systemd/system/x-ui.service -f
+        systemctl daemon-reload
+        systemctl reset-failed
+    elif [[ ${HAS_OPENRC:-0} -eq 1 ]]; then
+        rc-service x-ui stop >/dev/null 2>&1 || true
+        rc-update del x-ui >/dev/null 2>&1 || true
+        rm -f /etc/init.d/x-ui
+    else
+        pkill -f "/usr/local/x-ui/x-ui" >/dev/null 2>&1 || true
+    fi
     rm /etc/x-ui/ -rf
     rm /usr/local/x-ui/ -rf
     echo -e "\nUninstalled Successfully."
@@ -228,7 +236,14 @@ start() {
         echo ""
         LOGI "Panel is running, No need to start again, If you need to restart, please select restart"
     else
-        systemctl start x-ui
+        if [[ ${HAS_SYSTEMD:-0} -eq 1 ]]; then
+            systemctl start x-ui
+        elif [[ ${HAS_OPENRC:-0} -eq 1 ]]; then
+            ensure_openrc_service
+            rc-service x-ui start
+        else
+            nohup /usr/local/x-ui/x-ui >/var/log/x-ui.log 2>&1 &
+        fi
         sleep 2
         check_status
         if [[ $? == 0 ]]; then
@@ -249,7 +264,13 @@ stop() {
         echo ""
         LOGI "Panel stopped, No need to stop again!"
     else
-        systemctl stop x-ui
+        if [[ ${HAS_SYSTEMD:-0} -eq 1 ]]; then
+            systemctl stop x-ui
+        elif [[ ${HAS_OPENRC:-0} -eq 1 ]]; then
+            rc-service x-ui stop >/dev/null 2>&1 || true
+        else
+            pkill -f "/usr/local/x-ui/x-ui" >/dev/null 2>&1 || true
+        fi
         sleep 2
         check_status
         if [[ $? == 1 ]]; then
@@ -265,7 +286,19 @@ stop() {
 }
 
 restart() {
-    systemctl restart x-ui
+    if [[ ${HAS_SYSTEMD:-0} -eq 1 ]]; then
+        systemctl restart x-ui
+    elif [[ ${HAS_OPENRC:-0} -eq 1 ]]; then
+        ensure_openrc_service
+        rc-service x-ui restart >/dev/null 2>&1 || {
+            rc-service x-ui stop >/dev/null 2>&1 || true
+            rc-service x-ui start
+        }
+    else
+        pkill -f "/usr/local/x-ui/x-ui" >/dev/null 2>&1 || true
+        sleep 1
+        nohup /usr/local/x-ui/x-ui >/var/log/x-ui.log 2>&1 &
+    fi
     sleep 2
     check_status
     if [[ $? == 0 ]]; then
@@ -279,18 +312,44 @@ restart() {
 }
 
 status() {
-    systemctl status x-ui -l
+    if [[ ${HAS_SYSTEMD:-0} -eq 1 ]]; then
+        systemctl status x-ui -l
+    elif [[ ${HAS_OPENRC:-0} -eq 1 ]]; then
+        if rc-service x-ui status >/dev/null 2>&1; then
+            echo "x-ui service is running (OpenRC)"
+        else
+            echo "x-ui service is not running (OpenRC)"
+        fi
+    else
+        if pgrep -f "/usr/local/x-ui/x-ui" >/dev/null 2>&1; then
+            echo "x-ui process is running (non-systemd environment)"
+        else
+            echo "x-ui process is not running (non-systemd environment)"
+        fi
+    fi
     if [[ $# == 0 ]]; then
         before_show_menu
     fi
 }
 
 enable() {
-    systemctl enable x-ui
-    if [[ $? == 0 ]]; then
-        LOGI "x-ui Set to boot automatically on startup successfully"
+    if [[ ${HAS_SYSTEMD:-0} -eq 1 ]]; then
+        systemctl enable x-ui
+        if [[ $? == 0 ]]; then
+            LOGI "x-ui Set to boot automatically on startup successfully"
+        else
+            LOGE "x-ui Failed to set Autostart"
+        fi
+    elif [[ ${HAS_OPENRC:-0} -eq 1 ]]; then
+        ensure_openrc_service
+        rc-update add x-ui default >/dev/null 2>&1
+        if [[ $? == 0 ]]; then
+            LOGI "x-ui added to OpenRC default runlevel successfully"
+        else
+            LOGE "Failed to add x-ui to OpenRC autostart."
+        fi
     else
-        LOGE "x-ui Failed to set Autostart"
+        LOGE "Autostart management is only implemented for systemd/OpenRC. On this system, please configure x-ui autostart manually."
     fi
 
     if [[ $# == 0 ]]; then
@@ -299,11 +358,22 @@ enable() {
 }
 
 disable() {
-    systemctl disable x-ui
-    if [[ $? == 0 ]]; then
-        LOGI "x-ui Autostart Cancelled successfully"
+    if [[ ${HAS_SYSTEMD:-0} -eq 1 ]]; then
+        systemctl disable x-ui
+        if [[ $? == 0 ]]; then
+            LOGI "x-ui Autostart Cancelled successfully"
+        else
+            LOGE "x-ui Failed to cancel autostart"
+        fi
+    elif [[ ${HAS_OPENRC:-0} -eq 1 ]]; then
+        rc-update del x-ui >/dev/null 2>&1
+        if [[ $? == 0 ]]; then
+            LOGI "x-ui removed from OpenRC autostart successfully"
+        else
+            LOGE "Failed to remove x-ui from OpenRC autostart."
+        fi
     else
-        LOGE "x-ui Failed to cancel autostart"
+        LOGE "Autostart management is only implemented for systemd/OpenRC. On this system, please disable autostart manually."
     fi
 
     if [[ $# == 0 ]]; then
@@ -353,22 +423,55 @@ update_shell() {
 
 # 0: running, 1: not running, 2: not installed
 check_status() {
-    if [[ ! -f /etc/systemd/system/x-ui.service ]]; then
-        return 2
-    fi
-    temp=$(systemctl status x-ui | grep Active | awk '{print $3}' | cut -d "(" -f2 | cut -d ")" -f1)
-    if [[ x"${temp}" == x"running" ]]; then
-        return 0
+    if [[ ${HAS_SYSTEMD:-0} -eq 1 ]]; then
+        if [[ ! -f /etc/systemd/system/x-ui.service ]]; then
+            return 2
+        fi
+        temp=$(systemctl status x-ui | grep Active | awk '{print $3}' | cut -d "(" -f2 | cut -d ")" -f1)
+        if [[ x"${temp}" == x"running" ]]; then
+            return 0
+        else
+            return 1
+        fi
+    elif [[ ${HAS_OPENRC:-0} -eq 1 ]]; then
+        if [[ ! -x /usr/local/x-ui/x-ui ]]; then
+            return 2
+        fi
+        if rc-service x-ui status >/dev/null 2>&1; then
+            return 0
+        else
+            return 1
+        fi
     else
-        return 1
+        # Generic non-systemd/non-OpenRC environment: check binary and process
+        if [[ ! -x /usr/local/x-ui/x-ui ]]; then
+            return 2
+        fi
+        if pgrep -f "/usr/local/x-ui/x-ui" >/dev/null 2>&1; then
+            return 0
+        else
+            return 1
+        fi
     fi
 }
 
 check_enabled() {
-    temp=$(systemctl is-enabled x-ui)
-    if [[ x"${temp}" == x"enabled" ]]; then
-        return 0
+    if [[ ${HAS_SYSTEMD:-0} -eq 1 ]]; then
+        temp=$(systemctl is-enabled x-ui 2>/dev/null || echo "disabled")
+        if [[ x"${temp}" == x"enabled" ]]; then
+            return 0
+        else
+            return 1
+        fi
+    elif [[ ${HAS_OPENRC:-0} -eq 1 ]]; then
+        # Consider enabled if present in any runlevel
+        if rc-update show | grep -q "x-ui"; then
+            return 0
+        else
+            return 1
+        fi
     else
+        # No init integration => not enabled
         return 1
     fi
 }
@@ -592,6 +695,9 @@ ssl_cert_issue() {
         ;;
     arch | manjaro | parch)
         pacman -Sy --noconfirm socat
+        ;;
+    alpine)
+        apk update && apk add --no-cache socat
         ;;
     *)
         echo -e "${red}Unsupported operating system. Please check the script and install the necessary packages manually.${plain}\n"
@@ -944,6 +1050,9 @@ enable_bbr() {
     arch | manjaro | parch)
         pacman -Sy --noconfirm ca-certificates
         ;;
+    alpine)
+        apk update && apk add --no-cache ca-certificates
+        ;;
     *)
         echo -e "${red}Unsupported operating system. Please check the script and install the necessary packages manually.${plain}\n"
         exit 1
@@ -1209,3 +1318,39 @@ if [[ $# > 0 ]]; then
 else
     show_menu
 fi
+
+# Detect systemd
+if command -v systemctl &>/dev/null; then
+    HAS_SYSTEMD=1
+else
+    HAS_SYSTEMD=0
+fi
+
+# Detect OpenRC for Alpine and helper for OpenRC service
+if [[ "${release}" == "alpine" ]] && command -v rc-service &>/dev/null; then
+    HAS_OPENRC=1
+else
+    HAS_OPENRC=0
+fi
+
+ensure_openrc_service() {
+    if [[ ${HAS_OPENRC:-0} -ne 1 ]]; then
+        return 1
+    fi
+    if [[ ! -f /etc/init.d/x-ui ]]; then
+        cat >/etc/init.d/x-ui <<'EOF'
+#!/sbin/openrc-run
+
+name="x-ui panel"
+command="/usr/local/x-ui/x-ui"
+command_user="root"
+pidfile="/run/x-ui.pid"
+command_background="yes"
+
+depend() {
+    need net
+}
+EOF
+        chmod +x /etc/init.d/x-ui
+    fi
+}
